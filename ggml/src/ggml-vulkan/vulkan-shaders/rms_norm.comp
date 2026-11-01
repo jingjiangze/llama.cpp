@@ -9,8 +9,14 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
 
+#ifndef BLOCK_SIZE
+// BLOCK_SIZE is a specialization constant; the host picks 128/256/512 by row length.
 layout (constant_id = 3) const int BLOCK_SIZE = 512;
 layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+#else
+// ARC-LAB (Torchit1): compile-time fixed block size (-DBLOCK_SIZE=128) for short rows.
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #if RMS_NORM_ROPE_FUSION
 

@@ -1,0 +1,238 @@
+#version 450
+
+// ARC-LAB decode attention for a q4_0 KV cache: generation and MTP verify batches of 1-4 query tokens,
+// head size 256, GQA 6 (Bonsai 27B). Port of the SYCL kernel ggml-sycl/fattn-dec.cpp.
+// The generic path runs one work-group per query token (a 4-token verify reads the cache 4 times) and
+// pushes the 6 GQA rows through 16-row coopmat tiles. Here each work-group owns one KV head and a slice of
+// the context and serves all 6 query heads x NQ query tokens from one read of the q4_0 blocks:
+//   - scaled query rows in shared memory; K tile then V tile staged as raw q4_0 dwords (coalesced);
+//   - thread (row group, key) computes RPT scores straight from the nibbles; per-row online softmax with a
+//     finite running max (a fully masked tile or slice gets zero weight, never NaN);
+//   - thread d accumulates P.V for head dim d of every row; slices are merged by fa_split_k_reduce.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(constant_id = 0) const uint NQ = 4;   // query tokens per work-group (1, 2 or 4)
+layout(constant_id = 1) const uint TK = 64;  // keys per tile
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+const uint D    = 256;
+const uint WG   = 256;
+const uint G    = 6;
+const uint R    = G * NQ;             // query rows per KV head
+const uint RP   = (R + 3) / 4 * 4;    // padded row stride of the transposed scores
+const uint NRG  = WG / TK;            // row groups in the score phase
+const uint RPT  = R / NRG;            // rows per thread in the score phase
+const uint NB   = D / 32;             // q4_0 blocks per row
+const uint KW   = NB * 18 / 4;        // 36 dwords per q4_0 row
+const uint KWP  = KW + 1;             // padded shared row stride
+const float MINF = -1.0e30;
+
+layout(push_constant) uniform Parameters {
+    uint ne01;                  // query tokens
+    uint ne02;                  // query heads
+    uint ne11;                  // KV length
+    uint ne03;                  // sequences
+    uint q_s1, q_s2, q_s3;      // Q strides in floats
+    uint k_s1, k_s2, k_s3;      // K strides in dwords
+    uint v_s1, v_s2, v_s3;      // V strides in dwords
+    uint m_s1, m_s3, ne33;      // mask strides in halfs, mask broadcast over sequences
+    uint use_mask;
+    float scale;
+    uint nsplit;
+    uint chunk;
+};
+
+layout(binding = 0) readonly  buffer QB { vec4      data_q[]; };
+layout(binding = 1) readonly  buffer KB { uint      data_k[]; };
+layout(binding = 2) readonly  buffer VB { uint      data_v[]; };
+layout(binding = 3) readonly  buffer MB { float16_t data_m[]; };
+layout(binding = 4) writeonly buffer OB { float     data_o[]; };  // dst (nsplit == 1) or split_k partials
+
+shared vec4  sQ[R * D / 4];
+shared uint  sK[TK * KWP];
+shared float sS[TK * RP];   // [key][row]
+shared float sM[R];
+shared float sL[R];
+shared float sA[RP];
+
+uint byte_at(uint row, uint o) {
+    return (sK[row + o / 4] >> (8 * (o % 4))) & 0xFFu;
+}
+
+float half_at(uint row, uint o) {  // o even: both bytes in one dword
+    return unpackHalf2x16((sK[row + o / 4] >> (8 * (o % 4))) & 0xFFFFu).x;
+}
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint lane  = gl_SubgroupInvocationID;
+    const uint w     = gl_SubgroupID;
+    const uint split = gl_WorkGroupID.x;
+    const uint kvh   = gl_WorkGroupID.y;
+    const uint seq   = gl_WorkGroupID.z;
+
+    // query rows r = c * G + g: token c, head kvh * G + g, pre-scaled
+    for (uint e = tid; e < R * D / 4; e += WG) {
+        const uint r = e / (D / 4), d4 = e % (D / 4), c = r / G, g = r % G;
+        vec4 qv = vec4(0.0);
+        if (c < ne01) {
+            qv = data_q[(seq * q_s3 + c * q_s1 + (kvh * G + g) * q_s2) / 4 + d4];
+        }
+        sQ[e] = qv * scale;
+    }
+    if (tid < R) {
+        sM[tid] = MINF;
+        sL[tid] = 0.0;
+    }
+    if (tid < RP) {
+        sA[tid] = 1.0;
+    }
+
+    const uint k_begin = split * chunk;
+    const uint k_end   = min(k_begin + chunk, ne11);
+    const uint kbase   = seq * k_s3 + kvh * k_s2;
+    const uint vbase   = seq * v_s3 + kvh * v_s2;
+    const uint mbase   = (seq % ne33) * m_s3;
+
+    float o[RP];
+    [[unroll]] for (uint r = 0; r < RP; ++r) {
+        o[r] = 0.0;
+    }
+    barrier();
+
+    const uint rg = tid / TK;
+    const uint jj = tid % TK;
+    const uint r0 = rg * RPT;
+
+    for (uint t0 = k_begin; t0 < k_end; t0 += TK) {
+        // K tile -> shared memory
+        for (uint e = tid; e < TK * KW; e += WG) {
+            const uint kk = e / KW, wd = e % KW, j = t0 + kk;
+            sK[kk * KWP + wd] = j < k_end ? data_k[kbase + j * k_s1 + wd] : 0u;
+        }
+        barrier();
+
+        // scores of rows r0 .. r0 + RPT - 1 against key j
+        {
+            const uint j = t0 + jj;
+            float s[RPT];
+            [[unroll]] for (uint i = 0; i < RPT; ++i) {
+                s[i] = 0.0;
+            }
+            if (j < k_end) {
+                const uint kr = jj * KWP;
+                [[unroll]] for (uint b = 0; b < NB; ++b) {
+                    const uint  o0 = b * 18;
+                    const float dk = half_at(kr, o0);
+                    [[unroll]] for (uint i = 0; i < 16; i += 4) {
+                        vec4 k0, k1;
+                        [[unroll]] for (uint u = 0; u < 4; ++u) {
+                            const uint by = byte_at(kr, o0 + 2 + i + u);
+                            k0[u] = float(int(by & 0xFu) - 8) * dk;
+                            k1[u] = float(int(by >> 4) - 8) * dk;
+                        }
+                        const uint d4 = (b * 32 + i) / 4;
+                        [[unroll]] for (uint rr = 0; rr < RPT; ++rr) {
+                            const uint r = r0 + rr;
+                            s[rr] += dot(sQ[r * (D / 4) + d4], k0) + dot(sQ[r * (D / 4) + d4 + 4], k1);
+                        }
+                    }
+                }
+            }
+            [[unroll]] for (uint rr = 0; rr < RPT; ++rr) {
+                const uint r = r0 + rr, c = r / G;
+                float v = -1.0 / 0.0;
+                if (j < k_end && c < ne01) {
+                    v = s[rr] + (use_mask != 0u ? float(data_m[mbase + c * m_s1 + j]) : 0.0);
+                }
+                sS[jj * RP + r] = v;
+            }
+        }
+        barrier();
+
+        // V tile -> shared memory (the K tile is no longer needed)
+        for (uint e = tid; e < TK * KW; e += WG) {
+            const uint kk = e / KW, wd = e % KW, j = t0 + kk;
+            sK[kk * KWP + wd] = j < k_end ? data_v[vbase + j * v_s1 + wd] : 0u;
+        }
+
+        // online softmax, one row per subgroup at a time
+        for (uint r = w; r < R; r += gl_NumSubgroups) {
+            float mt = -1.0 / 0.0;
+            for (uint k = lane; k < TK; k += gl_SubgroupSize) {
+                mt = max(mt, sS[k * RP + r]);
+            }
+            mt = subgroupMax(mt);
+            const float m_old = sM[r];
+            const float m_new = max(m_old, mt);  // finite: m_old starts at MINF
+            float lt = 0.0;
+            for (uint k = lane; k < TK; k += gl_SubgroupSize) {
+                const float p = exp(sS[k * RP + r] - m_new);  // exp(-inf) = 0
+                sS[k * RP + r] = p;
+                lt += p;
+            }
+            lt = subgroupAdd(lt);
+            if (subgroupElect()) {
+                const float a = exp(m_old - m_new);
+                sA[r] = a;
+                sL[r] = sL[r] * a + lt;
+                sM[r] = m_new;
+            }
+        }
+        barrier();
+
+        // P.V for head dim d = tid (padded rows R..RP-1 carry P = 0 or garbage and are never written out)
+        {
+            const uint d  = tid;
+            const uint b  = d / 32;
+            const uint wi = d % 32;
+            const uint ob = b * 18;
+            const uint oq = ob + 2 + (wi % 16);
+            const uint sh = wi < 16 ? 0 : 4;
+            const uint nk = min(TK, k_end - t0);
+            [[unroll]] for (uint r = 0; r < RP; ++r) {
+                o[r] *= sA[r];
+            }
+            for (uint k = 0; k < nk; ++k) {
+                const uint  vr = k * KWP;
+                const float vv = float(int((byte_at(vr, oq) >> sh) & 0xFu) - 8) * half_at(vr, ob);
+                [[unroll]] for (uint r4 = 0; r4 < RP / 4; ++r4) {
+                    const uint pi = k * RP + 4 * r4;
+                    o[4 * r4 + 0] += sS[pi + 0] * vv;
+                    o[4 * r4 + 1] += sS[pi + 1] * vv;
+                    o[4 * r4 + 2] += sS[pi + 2] * vv;
+                    o[4 * r4 + 3] += sS[pi + 3] * vv;
+                }
+            }
+        }
+        barrier();
+    }
+
+    // dst is [D, ne02, ne01, ne03]; split_k partials follow fa_split_k_reduce: O [D, ne02, split, ne01, ne03],
+    // then L and M [ne02 each] per (split, token, sequence)
+    [[unroll]] for (uint r = 0; r < R; ++r) {
+        const uint c = r / G;
+        if (c >= ne01) {
+            continue;
+        }
+        const uint head = kvh * G + r % G;
+        if (nsplit == 1) {
+            const float l = sL[r];
+            data_o[((seq * ne01 + c) * ne02 + head) * D + tid] = l > 0.0 ? o[r] / l : 0.0;
+        } else {
+            const uint blk = split + nsplit * (c + ne01 * seq);
+            data_o[D * ne02 * blk + D * head + tid] = o[r];
+            if (tid == 0) {
+                const uint lm = D * ne02 * ne01 * ne03 * nsplit + ne02 * 2 * blk;
+                data_o[lm + head]        = sL[r];
+                data_o[lm + ne02 + head] = sM[r];
+            }
+        }
+    }
+}

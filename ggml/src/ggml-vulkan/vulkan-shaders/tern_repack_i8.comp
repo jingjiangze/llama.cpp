@@ -1,0 +1,107 @@
+#version 450
+
+// Ternary (PTQ1_0 / PQ2_0) weights -> int8 rows for the int8 coopmat GEMM (mm_i8_cm.comp).
+// Each 128-weight group has its own fp16 scale d_g. The group scales of a row are folded into the int8
+// values against the row maximum D:  w_i8 = code * round(QMAX * d_g / D),  row scale = D / QMAX,
+// so the GEMM needs one scale per row instead of one per group. QMAX is 127 for trits and 63 for PQ2_0
+// (codes up to +2). One workgroup per row.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#include "types.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint nblk;       // 128-weight blocks per row (K / 128)
+    uint stride_a;   // blocks between rows of A
+    uint row0;       // first row of this chunk
+    uint nrows;      // rows in this chunk
+} p;
+
+layout(binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout(binding = 1) writeonly buffer W {uint data_w[];};      // [nrows][K/4] packed int8
+layout(binding = 2) writeonly buffer S {float data_s[];};     // [nrows] row scale
+
+#if defined(DATA_A_PQ2_0)
+#define QMAX 63.0
+#else
+#define QMAX 127.0
+#endif
+
+shared float red[64];
+
+uint pack4(int a, int b, int c, int d) {
+    return (uint(a) & 0xFFu) | ((uint(b) & 0xFFu) << 8) | ((uint(c) & 0xFFu) << 16) | ((uint(d) & 0xFFu) << 24);
+}
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    if (r >= p.nrows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint abase = (p.row0 + r) * p.stride_a;
+
+    float m = 0.0;
+    for (uint b = tid; b < p.nblk; b += 64) {
+        m = max(m, abs(float(data_a[abase + b].d)));
+    }
+    red[tid] = m;
+    barrier();
+    [[unroll]] for (uint s = 32; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
+        }
+        barrier();
+    }
+    const float dmax = red[0];
+    const float inv = dmax > 0.0 ? QMAX / dmax : 0.0;
+    if (tid == 0) {
+        data_s[r] = dmax / QMAX;
+    }
+
+    const uint wbase = r * p.nblk * 32;  // 32 uints per block
+    for (uint b = tid; b < p.nblk; b += 64) {
+        const int q = int(round(float(data_a[abase + b].d) * inv));
+        int v[128];
+#if defined(DATA_A_PQ2_0)
+        [[unroll]] for (uint j = 0; j < 32; ++j) {
+            const uint byte = uint(data_a[abase + b].qs[j]);
+            [[unroll]] for (uint t = 0; t < 4; ++t) {
+                v[j * 4 + t] = (int((byte >> (2 * t)) & 3u) - 1) * q;
+            }
+        }
+#else
+        // PTQ1_0 element order (ptq1_0.glsl): qs[j], j < 16 -> elements t*16 + j; qs[16 + j], j < 8 -> 80 + t*8 + j;
+        // qh[h] -> 120 + t*2 + h; trits by the base-3 remainder recurrence t = (v*3) >> 8, v = (v*3) & 0xFF.
+        [[unroll]] for (uint j = 0; j < 16; ++j) {
+            uint x = uint(data_a[abase + b].qs[j]);
+            [[unroll]] for (uint t = 0; t < 5; ++t) {
+                v[t * 16 + j] = (int((x * 3u) >> 8) - 1) * q;
+                x = (x * 3u) & 0xFFu;
+            }
+        }
+        [[unroll]] for (uint j = 0; j < 8; ++j) {
+            uint x = uint(data_a[abase + b].qs[16 + j]);
+            [[unroll]] for (uint t = 0; t < 5; ++t) {
+                v[80 + t * 8 + j] = (int((x * 3u) >> 8) - 1) * q;
+                x = (x * 3u) & 0xFFu;
+            }
+        }
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            uint x = uint(data_a[abase + b].qh[h]);
+            [[unroll]] for (uint t = 0; t < 4; ++t) {
+                v[120 + t * 2 + h] = (int((x * 3u) >> 8) - 1) * q;
+                x = (x * 3u) & 0xFFu;
+            }
+        }
+#endif
+        [[unroll]] for (uint w = 0; w < 32; ++w) {
+            data_w[wbase + b * 32 + w] = pack4(v[4 * w], v[4 * w + 1], v[4 * w + 2], v[4 * w + 3]);
+        }
+    }
+}
