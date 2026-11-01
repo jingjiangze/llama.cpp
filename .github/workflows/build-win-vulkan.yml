@@ -1,0 +1,71 @@
+name: Build Win Vulkan
+
+# Trimmed copy of release-prism.yml's windows-vulkan job:
+# same toolchain (Vulkan SDK 1.4.313.2), same cmake flags, same self-contained
+# bundle layout. Drops the 12 unrelated jobs (macOS/SYCL/CUDA/ROCm) so a
+# dispatch finishes in ~15-20 min instead of ~2.5 h and cannot be cancelled by
+# an unrelated CUDA failure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'optional label (unused)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+jobs:
+  windows-vulkan:
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.313.2
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: windows-latest-vulkan-x64
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build
+        run: |
+          # Full self-contained bundle (CPU backends + Vulkan), not just the ggml-vulkan.dll
+          # add-on, so the zip can be swapped in for the official release as-is.
+          cmake -S . -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DLLAMA_BUILD_BORINGSSL=ON ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Pack artifacts
+        run: |
+          7z a -snl llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
+          name: llama-bin-win-vulkan-x64
