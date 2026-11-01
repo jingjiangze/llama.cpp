@@ -40,7 +40,16 @@ layout (constant_id = 3) const uint CG = 3;
 
 uint a_offset, b_offset, d_offset;
 
-#if defined(PTQ1_0_MUL3_PK16)
+#ifdef PTQ1_0_Y_IL
+// ARC-LAB: activations quantized dword-major per column (quantize_q8_1.comp QBLOCK_X4_IL): word w of x4 block blk of
+// column j at bcol[j] * 36 + w * num_blocks_per_row + blk, so the 8 lane pairs of a sub-group read one contiguous run per
+// word instead of 8 blocks 144 bytes apart. Used for 2..8 columns (one column keeps the plain layout and variant).
+#define YIL(j, w) data_b_u32[bcol[j] * Q8_1_X4_DWORDS + (w) * num_blocks_per_row + blk]
+#endif
+
+#if defined(PTQ1_0_MUL3_SHIFT)
+#define MUL3(v) (((v) << 1u) + (v))
+#elif defined(PTQ1_0_MUL3_PK16)
 #define MUL3(v) pack32(unpack16(v) * u16vec2(3us, 3us))
 #else
 // (v << 1u) + (v) maps to a single-cycle shift-add (v_lshl_add_u32) on AMD GCN/RDNA
@@ -95,10 +104,14 @@ void process_group(const uint j0) {
     if (nc == 1u) {
         // Single column: the row loop has a runtime bound, which keeps one row of decode state live (fewer registers than the level-major loop below).
         for (uint blk = blk_first; blk < num_blocks_per_row; blk += blk_stride) {
+#ifdef PTQ1_0_Y_IL
+            const uvec4 dsraw = uvec4(YIL(j0, 0u), YIL(j0, 1u), YIL(j0, 2u), YIL(j0, 3u));
+#else
             const uint bx4   = bcol[j0] + blk;
             const uint bbase = bx4 * Q8_1_X4_DWORDS + 4u;
 
             const uvec4 dsraw = data_b_u128[bx4 * Q8_1_X4_UVEC4];
+#endif
             const vec2 ds0 = unpackHalf2x16(dsraw.x);
             const vec2 ds1 = unpackHalf2x16(dsraw.y);
             const vec2 ds2 = unpackHalf2x16(dsraw.z);
@@ -117,11 +130,17 @@ void process_group(const uint j0) {
             int32_t yh0[5], yh1[5], yh2[5];
             int32_t yl0[5], yl1[5], yl2[5];
             [[unroll]] for (uint t = 0; t < 5; ++t) {
+#ifdef PTQ1_0_Y_IL
+                const uint y0 = YIL(j0, (sub != 0u) ? (7u + 4u*t) : (4u + 4u*t));
+                const uint y1 = YIL(j0, (sub != 0u) ? (24u + 2u*t) : (5u + 4u*t));
+                const uint y2 = YIL(j0, (sub != 0u) ? (25u + 2u*t) : (6u + 4u*t));
+#else
                 const uvec4 q4 = data_b_u128[(bbase >> 2u) + t];
                 const uvec2 q2 = data_b_u64[(bbase >> 1u) + 10u + t];
                 const uint y0 = (sub != 0u) ? q4.w : q4.x;
                 const uint y1 = (sub != 0u) ? q2.x : q4.y;
                 const uint y2 = (sub != 0u) ? q2.y : q4.z;
+#endif
                 yh0[t] = int32_t(y0 & 0xFF00FF00u);
                 yh1[t] = int32_t(y1 & 0xFF00FF00u);
                 yh2[t] = int32_t(y2 & 0xFF00FF00u);
@@ -130,7 +149,11 @@ void process_group(const uint j0) {
                 yl2[t] = int32_t((y2 << 8u) & 0xFF00FF00u);
             }
             // qh activations: elements 120..127
+#ifdef PTQ1_0_Y_IL
+            const uvec2 yq = uvec2(YIL(j0, 34u), YIL(j0, 35u));
+#else
             const uvec2 yq = data_b_u64[(bbase >> 1u) + 15u];
+#endif
             const int32_t yq0 = int32_t(yq.x);
             const int32_t yq1 = int32_t(yq.y);
 
@@ -229,7 +252,11 @@ void process_group(const uint j0) {
             uvec4 dsraw[CG];
             [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
                 bx4[jj]   = bcol[j0 + jj] + blk;
+#ifdef PTQ1_0_Y_IL
+                dsraw[jj] = uvec4(YIL(j0 + jj, 0u), YIL(j0 + jj, 1u), YIL(j0 + jj, 2u), YIL(j0 + jj, 3u));
+#else
                 dsraw[jj] = data_b_u128[bx4[jj] * Q8_1_X4_UVEC4];
+#endif
             }
 
             // accA: dword 0, always sub-block t/2. accB: dwords 1,2, sub-block t/2 on lane 0 and 2,2,3,3,3 on lane 1. Both change scale after levels 1 and 3.
@@ -246,12 +273,19 @@ void process_group(const uint j0) {
                 // The three activation words of this lane per column: lane 0 dwords 4t..4t+2, lane 1 dwords 4t+3, 20+2t, 21+2t. Only these are loaded: the compiler hoists the loads of all levels, so registers matter.
                 int32_t yp0[CG], yp1[CG], yp2[CG];
                 [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
+#ifdef PTQ1_0_Y_IL
+                    const uint w1 = (sub != 0u) ? (24u + 2u*t) : (5u + 4u*t);
+                    yp0[jj] = int32_t(YIL(j0 + jj, 4u + 4u*t + 3u*sub));
+                    yp1[jj] = int32_t(YIL(j0 + jj, w1));
+                    yp2[jj] = int32_t(YIL(j0 + jj, w1 + 1u));
+#else
                     const uint bbase = bx4[jj] * Q8_1_X4_DWORDS + 4u;
                     const uint i0 = bbase + 4u*t + 3u*sub;
                     const uint i1 = (sub != 0u) ? (bbase + 20u + 2u*t) : (bbase + 4u*t + 1u);
                     yp0[jj] = int32_t(data_b_u32[i0]);
                     yp1[jj] = int32_t(data_b_u32[i1]);
                     yp2[jj] = int32_t(data_b_u32[i1 + 1u]);
+#endif
                 }
 
                 // Decode this level once per row, then dot with every column.
@@ -285,10 +319,15 @@ void process_group(const uint j0) {
                     // qh: four trit levels of two bytes -> elements 120 + 2n + h, all in sub-block 3 (the scale of accB on lane 1 at this level). Lane 0 decodes zeros.
                     int32_t yq0[CG], yq1[CG];
                     [[unroll]] for (uint jj = 0; jj < nc; ++jj) {
+#ifdef PTQ1_0_Y_IL
+                        yq0[jj] = int32_t(YIL(j0 + jj, 34u));
+                        yq1[jj] = int32_t(YIL(j0 + jj, 35u));
+#else
                         const uint  bbase = bx4[jj] * Q8_1_X4_DWORDS + 4u;
                         const uvec2 yq = data_b_u64[(bbase >> 1u) + 15u];
                         yq0[jj] = int32_t(yq.x);
                         yq1[jj] = int32_t(yq.y);
+#endif
                     }
                     [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
                         uint vq = (sub != 0u) ? ((w6[n] & 0xFFu) | ((w6[n] & 0xFF00u) << 8u)) : 0u;

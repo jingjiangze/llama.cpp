@@ -1,0 +1,167 @@
+#version 450
+
+// ARC-LAB: PTQ1_0 x q8_1 mat-vec for 1..8 columns (MTP verify, short n-gram drafts), port of the SYCL decode-once kernel
+// (ggml-sycl/mmvq.cpp mul_mat_vec_ptq1_0_ncols_dec, 1.8x there at 4 columns). One lane per 128-weight block decodes its
+// trits ONCE into 32 int8x4 words (trit values 0..2 in element order), then dots them with every column; the activations
+// are interleaved per column (quantize_q8_1.comp QBLOCK_X4_IL: 16-byte chunk c of block b at 4 nb + (c nb + b) * 4
+// dwords), so each lane loads one uvec4 per chunk and the 16 lanes' loads are one contiguous run (a dword-interleaved
+// first version issued 4x the loads and lost). R rows per subgroup keep every lane busy when a row's block count is not
+// a multiple of 16 (Bonsai K 5120 = 40 blocks). Routed for 3..6 columns; mul_mat_vecq_ptq1_0.comp keeps 1, 2, 7, 8.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint NCOLS = 4;  // columns (1..8)
+layout(constant_id = 1) const uint R     = 2;  // rows per subgroup
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;  // 16 subgroups of 16
+
+const uint SG = 16;
+const uint NSG = 16;
+const uint PTQ1_0_DWORDS  = 7u;   // qs[24] as 6 dwords, then qh[0] | qh[1] << 8 | d << 16
+const uint Q8_1_X4_DWORDS = 36u;  // 4 ds words + 32 quant words per 128 activations
+
+#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
+#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
+
+layout (push_constant) uniform parameter
+{
+    uint ncols;
+    uint stride_a;
+    uint stride_b;
+    uint stride_d;
+
+    uint batch_stride_a;
+    uint batch_stride_b;
+    uint batch_stride_d;
+
+    uint fusion_flags;
+
+    uint base_work_group_y;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+layout (binding = 0) readonly  buffer A     {uint  data_a_u32[];};
+layout (binding = 1) readonly  buffer B     {uint  data_b_u32[];};
+layout (binding = 1) readonly  buffer B4    {uvec4 data_b_u128[];};
+layout (binding = 2) writeonly buffer D     {float data_d[];};
+layout (binding = 3) readonly  buffer Fuse0 {float data_fuse0[];};
+layout (binding = 4) readonly  buffer Fuse1 {float data_fuse1[];};
+
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg   = gl_SubgroupID;
+    const uint row0 = (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z) * (NSG * R) + sg * R;
+    const uint nrows = p.stride_d;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    // offsets (as mul_mat_vec_base.glsl get_offsets, non-ID)
+    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
+    uint batch_idx_a = 0;
+    if (batch_idx != 0) {
+        const uint i13 = batch_idx / p.ne12;
+        const uint i12 = batch_idx % p.ne12;
+        batch_idx_a = (i13 / p.broadcast3) * p.ne02 + i12 / p.broadcast2;
+    }
+    const uint a_offset = batch_idx_a * (p.batch_stride_a / 128u);
+    const uint b_offset = batch_idx * p.batch_stride_b;
+    const uint d_offset = batch_idx * p.batch_stride_d;
+
+    const uint nb = p.ncols / 128u;  // blocks per row
+
+    uint ycol[NCOLS];  // first dword of each column's interleaved activations
+    [[unroll]] for (uint j = 0; j < NCOLS; ++j) {
+        ycol[j] = ((j * p.batch_stride_b + b_offset) / 128u) * Q8_1_X4_DWORDS;
+    }
+
+    float acc[R][NCOLS];
+    [[unroll]] for (uint k = 0; k < R; ++k) {
+        [[unroll]] for (uint j = 0; j < NCOLS; ++j) {
+            acc[k][j] = 0.0;
+        }
+    }
+
+    for (uint i = lane; i < R * nb; i += SG) {
+        const uint r = i / nb;
+        const uint b = i - r * nb;
+        if (row0 + r >= nrows) {
+            continue;
+        }
+        const uint abase = (a_offset + (row0 + r) * nb + b) * PTQ1_0_DWORDS;
+        const uint w6 = data_a_u32[abase + 6u];
+        const float da = unpackHalf2x16(w6).y;
+
+        // decode: qw[e / 4] = trits (0..2) of elements e .. e + 3
+        int32_t qw[32];
+        [[unroll]] for (uint g = 0; g < 6; ++g) {
+            const uint packed = data_a_u32[abase + g];
+            const uint v_lo = packed & 0x00FF00FFu;
+            const uint v_hi = (packed >> 8u) & 0x00FF00FFu;
+            uint pow3 = 1u;
+            [[unroll]] for (uint t = 0; t < 5; ++t) {
+                const uint w_lo = ((v_lo * pow3) & 0x00FF00FFu) * 3u;
+                const uint w_hi = ((v_hi * pow3) & 0x00FF00FFu) * 3u;
+                const uint e = g < 4u ? t * 16u + 4u * g : 80u + t * 8u + 4u * (g - 4u);
+                qw[e / 4u] = int32_t(((w_lo >> 8u) & 0x00FF00FFu) | (w_hi & 0xFF00FF00u));
+                pow3 *= 3u;
+            }
+        }
+        {
+            uint v = (w6 & 0xFFu) | ((w6 & 0xFF00u) << 8u);
+            [[unroll]] for (uint t = 0; t < 4; t += 2) {
+                const uint w0 = v * 3u;
+                v = w0 & 0x00FF00FFu;
+                const uint w1 = v * 3u;
+                v = w1 & 0x00FF00FFu;
+                qw[(120u + 2u * t) / 4u] = int32_t(((w0 >> 8u) & 0xFFu) | ((w0 >> 16u) & 0xFF00u) | ((w1 << 8u) & 0xFF0000u) | (w1 & 0xFF000000u));
+            }
+        }
+
+        [[unroll]] for (uint j = 0; j < NCOLS; ++j) {
+            // column layout: ds [k][b] then 16-byte quant chunks [c][b] (quantize_q8_1.comp QBLOCK_X4_IL)
+            const uint yq4 = (ycol[j] + 4u * nb) / 4u + b;  // uvec4 index of chunk 0 of block b
+            int32_t si[4] = { 0, 0, 0, 0 };
+            [[unroll]] for (uint c = 0; c < 8; ++c) {
+                const uvec4 xv = data_b_u128[yq4 + c * nb];
+                si[c >> 1u] = dotPacked4x8AccSatEXT(qw[4u * c + 0u], int32_t(xv.x), si[c >> 1u]);
+                si[c >> 1u] = dotPacked4x8AccSatEXT(qw[4u * c + 1u], int32_t(xv.y), si[c >> 1u]);
+                si[c >> 1u] = dotPacked4x8AccSatEXT(qw[4u * c + 2u], int32_t(xv.z), si[c >> 1u]);
+                si[c >> 1u] = dotPacked4x8AccSatEXT(qw[4u * c + 3u], int32_t(xv.w), si[c >> 1u]);
+            }
+            float a = 0.0;
+            [[unroll]] for (uint k = 0; k < 4; ++k) {
+                const vec2 ds = unpackHalf2x16(data_b_u32[ycol[j] + k * nb + b]);
+                a += float(si[k]) * ds.x - ds.y;
+            }
+            const float v = da * a;
+            [[unroll]] for (uint k = 0; k < R; ++k) {
+                acc[k][j] += r == k ? v : 0.0;
+            }
+        }
+    }
+
+    [[unroll]] for (uint k = 0; k < R; ++k) {
+        [[unroll]] for (uint j = 0; j < NCOLS; ++j) {
+            float s = subgroupAdd(acc[k][j]);
+            const uint row = row0 + k;
+            if (lane == 0u && row < nrows) {
+                const uint di = j * p.batch_stride_d + d_offset + row;
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0u) {
+                    s += data_fuse0[di];
+                }
+                if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0u) {
+                    s += data_fuse1[di];
+                }
+                data_d[di] = s;
+            }
+        }
+    }
+}

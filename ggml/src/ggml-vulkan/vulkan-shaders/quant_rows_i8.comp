@@ -1,0 +1,63 @@
+#version 450
+
+// f32 activation rows -> int8 with one scale per row (token), for the int8 coopmat GEMM (mm_i8_cm.comp).
+// Rows nrows .. npad-1 are written as zeros so the GEMM can read whole tiles. One workgroup per row.
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint K;          // elements per row (multiple of 128)
+    uint stride_b;   // elements between rows of B
+    uint nrows;
+    uint npad;
+    uint b_offset;   // element offset of B in its buffer
+} p;
+
+layout(binding = 0) readonly buffer B {float data_b[];};
+layout(binding = 1) writeonly buffer Q {uint data_q[];};      // [npad][K/4] packed int8
+layout(binding = 2) writeonly buffer S {float data_s[];};     // [npad] row scale
+
+shared float red[256];
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint K4 = p.K / 4;
+    if (r >= p.nrows) {
+        for (uint w = tid; w < K4; w += 256) {
+            data_q[r * K4 + w] = 0u;
+        }
+        if (tid == 0) {
+            data_s[r] = 0.0;
+        }
+        return;
+    }
+    const uint base = p.b_offset + r * p.stride_b;
+    float m = 0.0;
+    for (uint i = tid; i < p.K; i += 256) {
+        m = max(m, abs(data_b[base + i]));
+    }
+    red[tid] = m;
+    barrier();
+    [[unroll]] for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = max(red[tid], red[tid + s]);
+        }
+        barrier();
+    }
+    const float amax = red[0];
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    if (tid == 0) {
+        data_s[r] = amax / 127.0;
+    }
+    for (uint w = tid; w < K4; w += 256) {
+        const uint i = base + 4 * w;
+        const int a = int(round(data_b[i] * inv));
+        const int b = int(round(data_b[i + 1] * inv));
+        const int c = int(round(data_b[i + 2] * inv));
+        const int d = int(round(data_b[i + 3] * inv));
+        data_q[r * K4 + w] = (uint(a) & 0xFFu) | ((uint(b) & 0xFFu) << 8) | ((uint(c) & 0xFFu) << 16) | ((uint(d) & 0xFFu) << 24);
+    }
+}

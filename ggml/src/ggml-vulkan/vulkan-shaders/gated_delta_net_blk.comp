@@ -1,0 +1,178 @@
+#version 450
+
+// ARC-LAB token-blocked gated delta net for prompt batches (non-KDA, S_V = 128, subgroup size 16).
+// Same recurrence as gated_delta_net.comp, but that kernel stalls on global-memory latency every token.
+// Here each subgroup owns NC columns and shares its k/q registers across them, and the work-group stages
+// T tokens of k, q, v, exp(g), beta in shared memory; the next block's global loads are issued before the
+// current block is computed, so their latency overlaps T steps of compute.
+// B580 / Mesa 26.2.3, 1024 tokens (old -> this, NC 2): 48 heads 4459 -> 1689 us, 32 heads 2308 -> 1191; 4 heads (NC 1)
+// 1557 -> 447. Whole model: pp512 646 -> 707, pp2048 712 -> 786 t/s. NC >= 4 spills at 128 GRF on Mesa 26.2.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint NC  = 8;    // columns per subgroup (<= 16)
+layout(constant_id = 1) const uint NW  = 16;   // subgroups per work-group
+layout(constant_id = 2) const uint T   = 8;    // tokens per staged block
+layout(constant_id = 3) const uint WGS = 256;  // NW * 16
+
+layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+
+const uint S_V = 128;
+const uint L   = 16;
+const uint RPL = S_V / L;
+const uint NCW = NC * NW;                // columns per work-group
+const uint PK  = T * S_V / WGS;          // per-invocation prefetch of k and q
+const uint PV  = T * NCW / WGS;          // per-invocation prefetch of v
+
+layout(push_constant) uniform Parameters {
+    uint H;
+    uint n_tokens;
+    uint n_seqs;
+    uint s_off;
+    uint sq1, sq2, sq3;
+    uint sv1, sv2, sv3;
+    uint sb1, sb2, sb3;
+    uint neq1, rq3;
+    float scale;
+    uint K;
+};
+
+layout(binding = 0) readonly  buffer QBuf     { float data_q[];     };
+layout(binding = 1) readonly  buffer KBuf     { float data_k[];     };
+layout(binding = 2) readonly  buffer VBuf     { float data_v[];     };
+layout(binding = 3) readonly  buffer GBuf     { float data_g[];     };
+layout(binding = 4) readonly  buffer BetaBuf  { float data_beta[];  };
+layout(binding = 5) readonly  buffer StateBuf { float data_state[]; };
+layout(binding = 6)           buffer DstBuf   { float data_dst[];   };
+
+shared float sk[T * S_V];
+shared float sq[T * S_V];
+shared float sv[T * NCW];
+shared float sgb[2 * T];
+
+float pk[PK];
+float pq[PK];
+float pv[PV];
+float pg = 0.0;
+float pb = 0.0;
+
+void fetch(uint t0, uint tid, uint qk_base, uint v_base, uint gb_base) {
+    [[unroll]] for (uint j = 0; j < PK; ++j) {
+        const uint e = tid + j * WGS, t = e / S_V, i = e % S_V;
+        const bool ok = t0 + t < n_tokens;
+        pk[j] = ok ? data_k[qk_base + (t0 + t) * sq2 + i] : 0.0;
+        pq[j] = ok ? data_q[qk_base + (t0 + t) * sq2 + i] : 0.0;
+    }
+    [[unroll]] for (uint j = 0; j < PV; ++j) {
+        const uint e = tid + j * WGS, t = e / NCW, c = e % NCW;
+        pv[j] = t0 + t < n_tokens ? data_v[v_base + (t0 + t) * sv2 + c] : 0.0;
+    }
+    if (tid < T && t0 + tid < n_tokens) {
+        pg = data_g[gb_base + (t0 + tid) * sb2];
+        pb = data_beta[gb_base + (t0 + tid) * sb2];
+    }
+}
+
+void main() {
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint w    = gl_SubgroupID;
+    const uint ncb  = S_V / NCW;
+    const uint head = gl_WorkGroupID.x / ncb;
+    const uint colb = (gl_WorkGroupID.x % ncb) * NCW;  // first column of the work-group
+    const uint col0 = colb + w * NC;                   // first column of this subgroup
+    const uint seq  = gl_WorkGroupID.y;
+    const uint iq1  = head % neq1;
+    const uint iq3  = seq / rq3;
+
+    const uint state_size          = S_V * S_V;
+    const uint state_base          = (seq * H + head) * state_size;  // same offset for s0 in and state out
+    const uint state_size_per_snap = state_size * H * n_seqs;
+
+    const uint qk_base   = iq3 * sq3 + iq1 * sq1;
+    const uint v_base    = seq * sv3 + head * sv1 + colb;
+    const uint gb_base   = seq * sb3 + head * sb1;
+    const uint attn_base = (seq * n_tokens * H + head) * S_V;
+
+    float s[NC][RPL];
+    [[unroll]] for (uint c = 0; c < NC; ++c) {
+        [[unroll]] for (uint r = 0; r < RPL; ++r) {
+            s[c][r] = data_state[state_base + (col0 + c) * S_V + r * L + lane];
+        }
+    }
+
+    fetch(0, tid, qk_base, v_base, gb_base);
+
+    for (uint t0 = 0; t0 < n_tokens; t0 += T) {
+        barrier();  // previous block's shared reads are done
+        [[unroll]] for (uint j = 0; j < PK; ++j) {
+            sk[tid + j * WGS] = pk[j];
+            sq[tid + j * WGS] = pq[j];
+        }
+        [[unroll]] for (uint j = 0; j < PV; ++j) {
+            sv[tid + j * WGS] = pv[j];
+        }
+        if (tid < T) {
+            sgb[tid]     = exp(pg);
+            sgb[T + tid] = pb;
+        }
+        barrier();
+        if (t0 + T < n_tokens) {
+            fetch(t0 + T, tid, qk_base, v_base, gb_base);  // in flight while this block is computed
+        }
+
+        const uint nt = min(T, n_tokens - t0);
+        for (uint t = 0; t < nt; ++t) {
+            float kr[RPL];
+            float qr[RPL];
+            [[unroll]] for (uint r = 0; r < RPL; ++r) {
+                kr[r] = sk[t * S_V + r * L + lane];
+                qr[r] = sq[t * S_V + r * L + lane];
+            }
+            const float g_val    = sgb[t];
+            const float beta_val = sgb[T + t];
+            float outv = 0.0;
+            [[unroll]] for (uint c = 0; c < NC; ++c) {
+                float kv_shard = 0.0;
+                [[unroll]] for (uint r = 0; r < RPL; ++r) {
+                    kv_shard += g_val * s[c][r] * kr[r];
+                }
+                const float kv_col    = subgroupAdd(kv_shard);
+                const float delta_col = (sv[t * NCW + w * NC + c] - kv_col) * beta_val;
+                float attn_partial = 0.0;
+                [[unroll]] for (uint r = 0; r < RPL; ++r) {
+                    s[c][r] = g_val * s[c][r] + kr[r] * delta_col;
+                    attn_partial += s[c][r] * qr[r];
+                }
+                const float attn_col = subgroupAdd(attn_partial);
+                if (lane == c) {
+                    outv = attn_col;
+                }
+            }
+            if (lane < NC) {
+                data_dst[attn_base + (t0 + t) * S_V * H + col0 + lane] = outv * scale;
+            }
+            if (K > 1u) {
+                const int target_slot = int(n_tokens) - 1 - int(t0 + t);
+                if (target_slot >= 0 && target_slot < int(K)) {
+                    const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_base;
+                    [[unroll]] for (uint c = 0; c < NC; ++c) {
+                        [[unroll]] for (uint r = 0; r < RPL; ++r) {
+                            data_dst[slot_base + (col0 + c) * S_V + r * L + lane] = s[c][r];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (K == 1u) {
+        [[unroll]] for (uint c = 0; c < NC; ++c) {
+            [[unroll]] for (uint r = 0; r < RPL; ++r) {
+                data_dst[s_off + state_base + (col0 + c) * S_V + r * L + lane] = s[c][r];
+            }
+        }
+    }
+}

@@ -1,0 +1,124 @@
+#version 450
+
+// int8 x int8 -> int32 GEMM on KHR cooperative matrices (Intel Xe2 XMX: 8x16x32 s8 tiles, subgroup 16),
+// with one scale per weight row and one per activation row applied in the epilogue:
+//   D[n][m] = sa[m] * sb[n] * sum_k A[m][k] * B[n][k]
+// A: [M][K] int8 (tern_repack_i8.comp), B: [npad][K] int8 (quant_rows_i8.comp), D: f32, M contiguous.
+// Workgroup tile BM x BN (SGM x SGN subgroups, each TI x TJ 8x16 accumulators), K staged 128 bytes at a time.
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+// subgroup grid SGM x SGN; each subgroup owns TI x TJ accumulators of 8 x 16 (rows = TI*8, cols = TJ*16)
+#ifndef SGM
+#define SGM 4   // B580 Mesa 26.2: 4x8 subgroups of 4x1 accumulators = 0 spills, 63.5 TFLOPS (4x4 of 4x2 spilled 101 regs: 27.2)
+#define SGN 8
+#define TI 4
+#define TJ 1
+#endif
+const uint SG = 16;
+const uint NT = SGM * SGN * SG;
+const uint BM = SGM * TI * 8;
+const uint BN = SGN * TJ * 16;
+const uint BK = 128;         // bytes of K per stage
+const uint KV = BK / 16;     // uvec4 per tile row
+const uint KS = KV + 1;      // padded shared-memory row stride (uvec4), against bank conflicts
+
+layout(local_size_x = NT, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform parameter {
+    uint M;          // rows of A in this chunk (multiple of BM)
+    uint N;          // real activation rows
+    uint K;          // multiple of 128
+    uint stride_d;   // elements between output rows (tokens)
+    uint d_offset;   // element offset of this chunk's first output
+} p;
+
+layout(binding = 0) readonly buffer A {uvec4 data_a[];};    // int8, 16 per uvec4
+layout(binding = 1) readonly buffer SA {float data_sa[];};
+layout(binding = 2) readonly buffer B {uvec4 data_b[];};
+layout(binding = 3) readonly buffer SB {float data_sb[];};
+layout(binding = 4) writeonly buffer D {float data_d[];};
+
+shared uvec4 sh_a[BM * KS];
+shared uvec4 sh_b[BN * KS];
+// Epilogue scratch (one 8x16 int32 accumulator per subgroup = 32 uvec4) reuses sh_a, free after the K loop: a separate
+// sh_c made this 53248 bytes, above ANV's maxComputeSharedMemorySize of 49152 (VUID-RuntimeSpirv-Workgroup-06530).
+const uint CS = 32;  // uvec4 per subgroup slot (NT / SG * CS must fit in BM * KS)
+
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = tid % SG;
+    const uint row0 = gl_WorkGroupID.x * BM;
+    const uint col0 = gl_WorkGroupID.y * BN;
+    const uint sg = tid / SG;
+    const uint sm = sg % SGM;
+    const uint sn = sg / SGM;
+    const uint K16 = p.K / 16;
+
+    coopmat<int32_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[TI][TJ];
+    [[unroll]] for (uint i = 0; i < TI; ++i) {
+        [[unroll]] for (uint j = 0; j < TJ; ++j) {
+            acc[i][j] = coopmat<int32_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0);
+        }
+    }
+
+    for (uint k = 0; k < p.K; k += BK) {
+        const uint k16 = k / 16;
+        [[unroll]] for (uint l = 0; l < BM * KV / NT; ++l) {
+            const uint idx = tid + l * NT;
+            const uint r = idx / KV, c = idx % KV;
+            sh_a[r * KS + c] = data_a[(row0 + r) * K16 + k16 + c];
+        }
+        [[unroll]] for (uint l = 0; l < BN * KV / NT; ++l) {
+            const uint idx = tid + l * NT;
+            const uint r = idx / KV, c = idx % KV;
+            sh_b[r * KS + c] = data_b[(col0 + r) * K16 + k16 + c];
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0; kk < BK / 32; ++kk) {
+            coopmat<int8_t, gl_ScopeSubgroup, 8, 32, gl_MatrixUseA> a[TI];
+            coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> b[TJ];
+            [[unroll]] for (uint i = 0; i < TI; ++i) {
+                coopMatLoad(a[i], sh_a, (sm * TI * 8 + i * 8) * KS + kk * 2, KS, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0; j < TJ; ++j) {
+                coopMatLoad(b[j], sh_b, (sn * TJ * 16 + j * 16) * KS + kk * 2, KS, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0; i < TI; ++i) {
+                [[unroll]] for (uint j = 0; j < TJ; ++j) {
+                    acc[i][j] = coopMatMulAdd(a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    // epilogue: one 8 x 16 accumulator at a time through this subgroup's slot of sh_a (column-major, 8 int32 = 2 uvec4
+    // per column); lane = output column (token). The K loop ended with a barrier, so sh_a is free.
+    const uint cslot = sg * CS;
+    [[unroll]] for (uint i = 0; i < TI; ++i) {
+        [[unroll]] for (uint j = 0; j < TJ; ++j) {
+            coopMatStore(acc[i][j], sh_a, cslot, 2, gl_CooperativeMatrixLayoutColumnMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            const uint col = col0 + sn * TJ * 16 + j * 16 + lane;
+            if (col < p.N) {
+                const float sb = data_sb[col];
+                const uint rb = row0 + sm * TI * 8 + i * 8;
+                const uvec4 c0 = sh_a[cslot + 2 * lane];
+                const uvec4 c1 = sh_a[cslot + 2 * lane + 1];
+                [[unroll]] for (uint r = 0; r < 8; ++r) {
+                    const int v = int(r < 4 ? c0[r] : c1[r - 4]);
+                    data_d[p.d_offset + col * p.stride_d + rb + r] = float(v) * data_sa[rb + r] * sb;
+                }
+            }
+            subgroupBarrier();
+        }
+    }
+}

@@ -750,6 +750,9 @@ void process_shaders() {
 #if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
                 string_to_spv("flash_attn_f32_f16", "flash_attn_cm1.comp",
                     merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
+                // ARC-LAB: 8x16x16 tile variant (Intel Xe2 / ANV)
+                string_to_spv("flash_attn_f32_f16_m8", "flash_attn_cm1.comp",
+                    merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}, {"COOPMAT_M8", "1"}}), fp16, true, false, f16acc);
 #endif
             }
 
@@ -832,6 +835,11 @@ void process_shaders() {
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
             string_to_spv("mul_mat_vec_" + tname + "_q8_1_f32_subgroup_no_shmem", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            if (tname == "ptq1_0") {  // ARC-LAB: interleaved-activation variant for 2..8 columns
+                string_to_spv("mul_mat_vec_ptq1_0_q8_1_f32_il", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"PTQ1_0_Y_IL", "1"}}));
+                string_to_spv("mul_mat_vec_ptq1_0_q8_1_f32_il_subgroup", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"PTQ1_0_Y_IL", "1"}}));
+                string_to_spv("mul_mat_vec_ptq1_0_q8_1_f32_il_subgroup_no_shmem", mmvq_shader, merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"PTQ1_0_Y_IL", "1"}}));
+            }
 
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_id_" + tname + "_q8_1_f32_subgroup", mmvq_shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
@@ -877,10 +885,15 @@ void process_shaders() {
         string_to_spv("rms_norm_mul_rope_f32_f32" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
         string_to_spv("rms_norm_mul_rope_f32_f16" + suffix, "rms_norm.comp", merge_maps(rms_dict, {{"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
     }
+    // ARC-LAB: 128-thread variant for short rows (Bonsai per-head norms: 128/256 elements, ~100K rows per prompt batch)
+    // Note: BLOCK_SIZE is a specialization constant in rms_norm.comp (128/256/512 picked by the host); this variant
+    // pins it at compile time via -DBLOCK_SIZE=128, which selects the shader's compile-time branch.
+    string_to_spv("rms_norm_small_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}}));
     string_to_spv("rms_norm_mul_add_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"RMS_NORM_ADD_FUSION", "1"}}));
     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
     string_to_spv("l2_norm_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+    string_to_spv("l2_norm_small_f32", "l2_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"BLOCK_SIZE", "128"}}));  // ARC-LAB: short rows
 
     string_to_spv("cpy_32", "copy.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
     string_to_spv("cpy_f32_f16", "copy.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float16_t"}});
@@ -964,11 +977,25 @@ void process_shaders() {
     string_to_spv("fa_sparse_compact", "flash_attn_sparse_compact.comp", {});
     string_to_spv("fa_sparse_compact_subgroup", "flash_attn_sparse_compact.comp", {{"USE_SUBGROUPS", "1"}});
 
+    // ARC-LAB: ternary int8 coopmat GEMM path (tern_repack_i8 -> quant_rows_i8 -> mm_i8_cm)
+    string_to_spv("tern_repack_i8_ptq1_0", "tern_repack_i8.comp", {{"DATA_A_PTQ1_0", "1"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("tern_repack_i8_pq2_0", "tern_repack_i8.comp", {{"DATA_A_PQ2_0", "1"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("quant_rows_i8", "quant_rows_i8.comp", {});
+#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+    string_to_spv("mm_i8", "mm_i8_cm.comp", {}, true, true);
+    string_to_spv("fa_pf_gqa", "flash_attn_pf_gqa.comp", {}, true, true);  // ARC-LAB Intel prompt FA, GQA-packed
+#endif
+
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
     string_to_spv("quantize_q8_1_x4", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}});
     string_to_spv("quantize_q8_1_x4_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"USE_SUBGROUPS", "1"}});
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+    string_to_spv("mul_mat_vecq_ptq1_0_mc", "mul_mat_vecq_ptq1_0_mc.comp", {});  // ARC-LAB decode-once multi-column
+#endif
+    string_to_spv("quantize_q8_1_x4_il", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"QBLOCK_X4_IL", "1"}});
+    string_to_spv("quantize_q8_1_x4_il_subgroup", "quantize_q8_1.comp", {{"QBLOCK_X4", "1"}, {"QBLOCK_X4_IL", "1"}, {"USE_SUBGROUPS", "1"}});
 
     string_to_spv("mul_f32", "mul.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
@@ -1186,6 +1213,8 @@ void process_shaders() {
     string_to_spv("gated_delta_net_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}}));
     string_to_spv("gated_delta_net_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
     string_to_spv("gated_delta_net_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}}));
+    string_to_spv("gated_delta_net_blk_f32", "gated_delta_net_blk.comp", base_dict);  // ARC-LAB token-blocked prompt kernel
+    string_to_spv("flash_attn_dec_q4_0_f32", "flash_attn_dec_q4_0.comp", base_dict);  // ARC-LAB q4_0-cache decode attention
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

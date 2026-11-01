@@ -745,6 +745,9 @@ struct vk_device_struct {
     bool coopmat_bf16_support {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    // ARC-LAB port (Torchit1 753323e60): 8x16x16 coopmat tiles (Intel Xe2)
+    bool coopmat_support_8x16x16_f16acc {}; // ARC-LAB port (Torchit1 753323e60)
+    bool coopmat_support_8x16x16_f32acc {}; // ARC-LAB port (Torchit1 753323e60)
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -799,6 +802,14 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_quantize_q8_1_x4_il; // ARC-LAB port (Torchit1 753323e60)
+
+    // ARC-LAB port (Torchit1 753323e60): ternary int8 (PTQ1_0) coopmat GEMM + multi-column decode.
+    // [rr-1][cols-1], rr in 1..2, cols in 1..mul_mat_vec_max_cols (creation loop bounds).
+    vk_pipeline pipeline_tern_repack_i8[2]; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_quant_rows_i8; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_mm_i8_cm; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_ptq1_mc[2][mul_mat_vec_max_cols]; // ARC-LAB port (Torchit1 753323e60)
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -872,6 +883,7 @@ struct vk_device_struct {
     std::array<vk_pipeline, 3> pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    vk_pipeline pipeline_l2_norm_small_f32; // ARC-LAB port (Torchit1 753323e60)
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];
@@ -981,6 +993,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    // ARC-LAB port (Torchit1 753323e60): token-blocked GDN prompt kernel, one entry per detect variant (8).
+    bool gdn_blk {}; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_gated_delta_net_blk[8]; // ARC-LAB port (Torchit1 753323e60)
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -996,6 +1011,11 @@ struct vk_device_struct {
     std::map<vk_conv3d_pipeline_state, vk_pipeline> pipeline_conv3d_f16_f32[CONV_SHAPE_COUNT];
     vk_pipeline pipeline_conv2d_dw_whcn_f32, pipeline_conv2d_dw_whcn_f16_f32;
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
+
+    // ARC-LAB port (Torchit1 753323e60): q4_0-cache decode attention (3 query-token shapes) + 8x16x16 prompt FA.
+    bool fa_dec {}; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_fa_dec_q4_0[3]; // ARC-LAB port (Torchit1 753323e60)
+    vk_pipeline pipeline_fa_pf_gqa; // ARC-LAB port (Torchit1 753323e60)
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16;
 

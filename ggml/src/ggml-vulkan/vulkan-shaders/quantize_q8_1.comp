@@ -16,6 +16,9 @@ layout (push_constant) uniform parameter
 {
     uint ne;
     uint num_blocks;
+#ifdef QBLOCK_X4_IL
+    uint nb_col;  // x4 blocks per column
+#endif
 } p;
 
 #include "types.glsl"
@@ -24,7 +27,12 @@ layout(constant_id = 0) const uint GROUP_SIZE = 32;
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {vec4 data_a[];};
-#ifndef QBLOCK_X4
+#if defined(QBLOCK_X4_IL)
+// ARC-LAB: x4 blocks of a column interleaved across blocks: ds words [k][block] (4 x nb dwords), then the 32 quant words
+// as 8 chunks of 16 bytes, chunk c of block b at 4 * nb + (c * nb + b) * 4, so the lanes of the PTQ1_0 multi-column
+// mat-vec (one block per lane) read one chunk of consecutive blocks as one contiguous run (mul_mat_vecq_ptq1_0_mc.comp)
+layout (binding = 1) writeonly buffer D {uint data_b32[];};
+#elif !defined(QBLOCK_X4)
 layout (binding = 1) writeonly buffer D {block_q8_1_packed32 data_b[];};
 #else
 layout (binding = 1) writeonly buffer D {block_q8_1_x4 data_b[];};
@@ -81,7 +89,17 @@ void quantize(const uint wgid) {
     const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
     vals = round(vals * d_inv);
 
-#ifndef QBLOCK_X4
+#if defined(QBLOCK_X4_IL)
+    const uint il_col  = ibx4_outer / p.nb_col;
+    const uint il_blk  = ibx4_outer % p.nb_col;
+    const uint il_base = il_col * p.nb_col * 36u;
+    // quant word w = ibx4_inner * 8 + iqs (0..31) -> 16-byte chunk c = w / 4 of this block, next to the same chunk of the
+    // neighbouring blocks (one uvec4 per lane in mul_mat_vecq_ptq1_0_mc.comp)
+    {
+        const uint qw = ibx4_inner * 8u + iqs;
+        data_b32[il_base + 4u * p.nb_col + ((qw / 4u) * p.nb_col + il_blk) * 4u + (qw % 4u)] = uint(pack32(i8vec4(round(vals))));
+    }
+#elif !defined(QBLOCK_X4)
     data_b[ib].qs[iqs] = pack32(i8vec4(round(vals)));
 #else
     data_b[ibx4_outer].qs[ibx4_inner * 8 + iqs] = pack32(i8vec4(round(vals)));
@@ -110,7 +128,9 @@ void quantize(const uint wgid) {
         const float sum = shmem[tid];
 #endif
 
-#ifndef QBLOCK_X4
+#if defined(QBLOCK_X4_IL)
+        data_b32[il_base + ibx4_inner * p.nb_col + il_blk] = packHalf2x16(vec2(d, sum * d));
+#elif !defined(QBLOCK_X4)
         data_b[ib].ds = f16vec2(vec2(d, sum * d));
 #else
         data_b[ibx4_outer].ds[ibx4_inner] = f16vec2(vec2(d, sum * d));
