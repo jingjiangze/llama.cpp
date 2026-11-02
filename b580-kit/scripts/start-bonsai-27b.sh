@@ -38,8 +38,16 @@ DEFAULT_MODEL="$XDG_MODEL"
 MODEL="${MODEL:-$DEFAULT_MODEL}"
 SPEC=""
 # 只有模型文件名带 mtp 时才开投机（基础版没有 nextn 块，开了会报错）
+# SPEC_DEPTH：序列位置超过该值就停止起草（0=不停）。
+#   实测（ctx 131072、q4 KV、r3 头）：净加速 1K 1.52x / 4K 1.31x / 8K 1.21x / 12K 1.05x / 20K 0.92x
+#   ⇒ 交叉点约 15K；设 8192 可保住浅段的收益、深处自动退回无投机
 case "$MODEL" in
-  *[mM][tT][pP]*) [ "$MTP" = "1" ] && SPEC="--spec-type draft-mtp --spec-draft-n-max ${SPEC_NMAX:-2}" ;;
+  *[mM][tT][pP]*)
+    if [ "$MTP" = "1" ]; then
+      SPEC="--spec-type draft-mtp --spec-draft-n-max ${SPEC_NMAX:-2}"
+      [ -n "${SPEC_DEPTH:-}" ] && [ "${SPEC_DEPTH}" != "0" ] && SPEC="$SPEC --spec-draft-depth-max ${SPEC_DEPTH}"
+    fi
+    ;;
 esac
 PORT="${PORT:-8080}"
 CTX="${CTX:-32768}"

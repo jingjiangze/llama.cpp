@@ -11,6 +11,7 @@ set KV=q4_0
 set ALIAS=bonsai-27b
 set MTP=1
 set SPEC_NMAX=2
+set SPEC_DEPTH=8192
 set MODEL=./Ternary-Bonsai-2-27B-PTQ1_0-MTP-r3-Q4_0.gguf
 set BUDGET_TOKENS=120000
 set POOL=./kv-pool
