@@ -82,6 +82,45 @@ function bestSnapshot(chain, convId) {
     return best;
 }
 
+// ---------- 请求净化 ----------
+// 病因（2026-11-02 实测）：GGUF 内嵌的 qwen35 聊天模板对 reasoning_effort 做白名单校验
+//   {% if resolved_reasoning_effort not in ('xhigh','medium','low') %} raise_exception(...)
+// 客户端（ZCode 等）传 'high' / 'minimal' 之类 → 模板抛异常 → HTTP 500 → 界面一片空白。
+// 我们本来就跑 --reasoning-budget 0，把它映射进白名单即可。
+const RE_ALLOWED = new Set(['xhigh', 'medium', 'low']);
+const RE_MAP = {
+    max: 'xhigh', xhigh: 'xhigh', extreme: 'xhigh',
+    high: 'xhigh', medium: 'medium', mid: 'medium',
+    low: 'low', minimal: 'low', none: 'low', off: 'low', disabled: 'low',
+};
+
+function sanitize(body) {
+    const out = { ...body };
+    const notes = [];
+
+    // 顶层 reasoning_effort 模板不消费、还可能干扰 → 去掉
+    if (out.reasoning_effort !== undefined) {
+        notes.push(`drop-re=${out.reasoning_effort}`);
+        delete out.reasoning_effort;
+    }
+
+    const kw = out.chat_template_kwargs;
+    if (kw && typeof kw === 'object') {
+        const nk = { ...kw };
+        const v = nk.reasoning_effort;
+        if (v !== undefined) {
+            const s = String(v).toLowerCase();
+            if (!RE_ALLOWED.has(s)) {
+                const mapped = RE_MAP[s] || 'low';
+                nk.reasoning_effort = mapped;
+                notes.push(`remap-re=${v}->${mapped}`);
+            }
+        }
+        out.chat_template_kwargs = nk;
+    }
+    return { body: out, notes };
+}
+
 // ---------- 与上游交互 ----------
 async function upstreamJson(pathname, body) {
     const r = await fetch(UPSTREAM + pathname, {
@@ -214,15 +253,18 @@ const stats = { requests: 0, restored: 0, compacted: 0, saved: 0, passthrough: 0
 
 // ---------- 主处理 ----------
 async function handleChat(reqBody, res) {
-    const messages = Array.isArray(reqBody?.messages) ? reqBody.messages : [];
-    const convId = String(reqBody?.user || reqBody?.conversation_id || reqBody?.metadata?.conversation_id || 'default');
+    // 先净化：不在白名单里的 reasoning_effort 会让上游模板 raise -> 500 -> 客户端空白
+    const san = sanitize(reqBody);
+    const body0 = san.body;
+    const messages = Array.isArray(body0?.messages) ? body0.messages : [];
+    const convId = String(body0?.user || body0?.conversation_id || body0?.metadata?.conversation_id || 'default');
     const est = estimateTokens(messages);
 
     const chain = prefixChain(messages);
     let action = 'passthrough';
     let restoreName = null;
-    let outBody = { ...reqBody, messages };
-    const notes = [];
+    let outBody = { ...body0, messages };
+    const notes = [...san.notes];
 
     // 1) 先把明显超窗的处理掉（相关性裁剪）
     if (est > BUDGET_TOKENS) {

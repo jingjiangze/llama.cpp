@@ -174,6 +174,29 @@ L0 实现：**前缀/轮次级** KV 快照复用（走 `slot save/restore`），
 
 ---
 
+
+---
+
+## 7.5 ⚠ 客户端输出空白（实测过，必读）
+
+**症状**：在客户端（ZCode 等）发「你好」没有任何输出。
+
+**根因**：GGUF 内嵌的 qwen35 聊天模板对 `reasoning_effort` 做白名单校验——
+
+```jinja
+{%- set resolved = reasoning_effort|default('xhigh') %}
+{%- if resolved not in ('xhigh', 'medium', 'low') %}
+{{- raise_exception('Unexpected reasoning effort ...') }}
+```
+
+客户端传 `high` / `minimal` 之类 → **模板抛异常 → HTTP 500 → 界面空白**。
+服务端日志特征：`500 ... While executing CallExpression at line 49`。
+
+**已修**：`kv-pager` 转发前把 `reasoning_effort` 映射进白名单
+（`high→xhigh`、`minimal/none→low`），顶层同名字段直接丢弃；响应头 `x-kv-pager-notes` 会写 `remap-re=`。
+
+⚠ **必须走 :8081**。直连 :8080 仍会 500 —— 这是模板行为，不是 server bug。
+
 ## 8. 与 llama.cpp 上游的关系
 
 引擎侧改动（Vulkan 内核移植、`p=128` 偏移排除等）在 `port/torchit-vk` 分支与对应 Release 里。
